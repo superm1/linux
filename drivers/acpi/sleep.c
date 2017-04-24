@@ -160,6 +160,10 @@ static int __init init_nvs_nosave(const struct dmi_system_id *d)
 	return 0;
 }
 
+#ifdef CONFIG_SUSPEND
+static int __init init_upep_device(const struct dmi_system_id *d);
+#endif
+
 static struct dmi_system_id acpisleep_dmi_table[] __initdata = {
 	{
 	.callback = init_old_suspend_ordering,
@@ -343,6 +347,15 @@ static struct dmi_system_id acpisleep_dmi_table[] __initdata = {
 		DMI_MATCH(DMI_PRODUCT_NAME, "80E3"),
 		},
 	},
+#ifdef CONFIG_SUSPEND
+	{
+	 .callback = init_upep_device,
+	 .ident = "All Dell systems",
+	 .matches = {
+		      DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+		},
+	},
+#endif
 	{},
 };
 
@@ -649,6 +662,94 @@ static const struct platform_suspend_ops acpi_suspend_ops_old = {
 	.recover = acpi_pm_finish,
 };
 
+/*
+ * The micro-PEP (uPEP) device object is exposed in ACPI tables on systems
+ * supporting Windows 10 with Modern Standby.  The _DSM object under it, if
+ * present, can be used to indicate to the platform that the OS is transitioning
+ * into a low-power state in which certain types of activity are not desirable.
+ */
+static acpi_handle upep_device_handle;
+
+#define ACPI_S2IDLE_SCREEN_OFF	3
+#define ACPI_S2IDLE_SCREEN_ON	4
+#define ACPI_S2IDLE_IR_ENTRY	5
+#define ACPI_S2IDLE_IR_EXIT	6
+
+#define ACPI_S2IDLE_DSM_MASK	((1 << ACPI_S2IDLE_IR_ENTRY) | (1 << ACPI_S2IDLE_IR_EXIT))
+
+static char upep_dsm_func_mask;
+
+/* uPEP device _DSM UUID: c4eb40a0-6cd2-11e2-bcfd-0800200c9a66 */
+static const u8 upep_dsm_uuid[16] = {
+	0xa0, 0x40, 0xeb, 0xc4, 0xd2, 0x6c, 0xe2, 0x11,
+	0xbc, 0xfd, 0x08, 0x00, 0x20, 0x0c, 0x9a, 0x66
+};
+
+static void acpi_sleep_call_upep_dsm(unsigned int func)
+{
+	union acpi_object *out_obj;
+
+	if (!(upep_dsm_func_mask & (1 << func)))
+		return;
+
+	out_obj = acpi_evaluate_dsm(upep_device_handle, upep_dsm_uuid, 1, func,
+				    NULL);
+	ACPI_FREE(out_obj);
+
+	acpi_handle_debug(upep_device_handle, "_DSM function %u evaluation %s\n",
+			  func, out_obj ? "successful" : "failed");
+}
+
+static int upep_device_attach(struct acpi_device *adev,
+			      const struct acpi_device_id *not_used)
+{
+	union acpi_object *out_obj;
+
+	if (upep_device_handle)
+		return 0;
+
+	/* Check if the _DSM is present and as expected. */
+	out_obj = acpi_evaluate_dsm(adev->handle, upep_dsm_uuid, 1, 0, NULL);
+	if (out_obj && out_obj->type == ACPI_TYPE_BUFFER) {
+		char bitmask = *(char *)out_obj->buffer.pointer;
+
+		if (bitmask & ACPI_S2IDLE_DSM_MASK) {
+			upep_dsm_func_mask = bitmask;
+			upep_device_handle = adev->handle;
+		}
+
+		acpi_handle_debug(adev->handle, "_DSM function mask: 0x%x\n",
+				  bitmask);
+	} else {
+		acpi_handle_debug(adev->handle,
+				  "_DSM function 0 evaluation failed\n");
+	}
+	ACPI_FREE(out_obj);
+	return 0;
+}
+
+static const struct acpi_device_id upep_device_ids[] = {
+	{"INT33A1", },
+	{"PNP0D80", },
+	{"", },
+};
+
+static struct acpi_scan_handler upep_handler = {
+	.ids = upep_device_ids,
+	.attach = upep_device_attach,
+};
+
+static int __init init_upep_device(const struct dmi_system_id *d)
+{
+	acpi_scan_add_handler(&upep_handler);
+	return 0;
+}
+
+bool acpi_sleep_ec_gpe_may_wakeup(void)
+{
+	return !!upep_device_handle;
+}
+
 static int acpi_freeze_begin(void)
 {
 	acpi_scan_lock_acquire();
@@ -657,12 +758,39 @@ static int acpi_freeze_begin(void)
 
 static int acpi_freeze_prepare(void)
 {
+	acpi_sleep_call_upep_dsm(ACPI_S2IDLE_SCREEN_OFF);
+	acpi_sleep_call_upep_dsm(ACPI_S2IDLE_IR_ENTRY);
 	acpi_enable_wakeup_devices(ACPI_STATE_S0);
 	acpi_enable_all_wakeup_gpes();
 	acpi_os_wait_events_complete();
 	if (acpi_sci_irq_valid())
 		enable_irq_wake(acpi_sci_irq);
+
 	return 0;
+}
+
+static void acpi_freeze_wake(void)
+{
+	/*
+	 * If IRQD_WAKEUP_ARMED is not set for the SCI at this point, it means
+	 * that the SCI has triggered while suspended, so cancel the wakeup in
+	 * case it has not been a wakeup event (the GPEs will be checked later).
+	 */
+	if (acpi_sci_irq_valid() &&
+	    !irqd_is_wakeup_armed(irq_get_irq_data(acpi_sci_irq)))
+		pm_system_cancel_wakeup();
+}
+
+static void acpi_freeze_sync(void)
+{
+	/*
+	 * Process all pending events in case there are any wakeup ones.
+	 *
+	 * The EC driver uses the system workqueue, so that one needs to be
+	 * flushed too.
+	 */
+	acpi_os_wait_events_complete();
+	flush_scheduled_work();
 }
 
 static void acpi_freeze_restore(void)
@@ -670,7 +798,10 @@ static void acpi_freeze_restore(void)
 	acpi_disable_wakeup_devices(ACPI_STATE_S0);
 	if (acpi_sci_irq_valid())
 		disable_irq_wake(acpi_sci_irq);
+
 	acpi_enable_all_runtime_gpes();
+	acpi_sleep_call_upep_dsm(ACPI_S2IDLE_IR_EXIT);
+	acpi_sleep_call_upep_dsm(ACPI_S2IDLE_SCREEN_ON);
 }
 
 static void acpi_freeze_end(void)
@@ -681,6 +812,8 @@ static void acpi_freeze_end(void)
 static const struct platform_freeze_ops acpi_freeze_ops = {
 	.begin = acpi_freeze_begin,
 	.prepare = acpi_freeze_prepare,
+	.wake = acpi_freeze_wake,
+	.sync = acpi_freeze_sync,
 	.restore = acpi_freeze_restore,
 	.end = acpi_freeze_end,
 };
@@ -700,6 +833,11 @@ static void acpi_sleep_suspend_setup(void)
 
 #else /* !CONFIG_SUSPEND */
 static inline void acpi_sleep_suspend_setup(void) {}
+
+bool acpi_sleep_ec_gpe_may_wakeup(void)
+{
+	return false;
+}
 #endif /* !CONFIG_SUSPEND */
 
 #ifdef CONFIG_PM_SLEEP
