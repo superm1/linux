@@ -826,6 +826,17 @@ static void acpi_sleep_suspend_setup(void)
 		if (acpi_sleep_state_supported(i))
 			sleep_states[i] = 1;
 
+	/*
+	 * Use suspend-to-idle by default if
+         * - ACPI_FADT_LOW_POWER_S0 is set,
+         * - The system uses upep for wakeup
+         * - the default suspend mode not selected on cmdline
+	 */
+	if (acpi_gbl_FADT.flags & ACPI_FADT_LOW_POWER_S0 &&
+	    upep_device_handle &&
+	    mem_sleep_default > PM_SUSPEND_MEM)
+		mem_sleep_default = PM_SUSPEND_FREEZE;
+
 	suspend_set_ops(old_suspend_ordering ?
 		&acpi_suspend_ops_old : &acpi_suspend_ops);
 	freeze_set_ops(&acpi_freeze_ops);
